@@ -78,11 +78,11 @@ npm run seed
 
 ### Usuarios creados
 
-| Usuario   |   Rol  |
-|-----------|--------|
-| `admin`   | admin  |
-| `almacen` |  user  |
-| `manager` |  admin |
+| Usuario   | Contraseña      | Rol   |
+|-----------|-----------------|-------|
+| `admin`   | `admin123`      | admin |
+| `almacen` | `Almacen2024!`  | user  |
+| `manager` | `Manager2024!`  | admin |
 
 El script es idempotente: si los usuarios o productos ya existen no los duplica.
 
@@ -106,7 +106,7 @@ WordPress necesita un token JWT para autenticarse contra la API del almacén y p
 # 1. Obtener un JWT de usuario
 TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"***********"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+  -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 # 2. Generar el token de API
 curl -s -X POST http://localhost:3000/api/tokens/generate \
@@ -136,10 +136,10 @@ services:
   mariadb:
     image: mariadb:10.6
     environment:
-      MYSQL_ROOT_PASSWORD: "********"
+      MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: dolibarr
       MYSQL_USER: dolibarr
-      MYSQL_PASSWORD: "******"
+      MYSQL_PASSWORD: dolibarr
     volumes:
       - dolibarr_db:/var/lib/mysql
     restart: unless-stopped
@@ -150,11 +150,11 @@ services:
       DOLI_DB_HOST:     mariadb
       DOLI_DB_NAME:     dolibarr
       DOLI_DB_USER:     dolibarr
-      DOLI_DB_PASSWORD: "******"
+      DOLI_DB_PASSWORD: dolibarr
       DOLI_DB_TYPE:     mysqli
       DOLI_URL_ROOT:    http://localhost:8080
       DOLI_ADMIN_LOGIN: admin
-      DOLI_ADMIN_PASSWORD: "*****"
+      DOLI_ADMIN_PASSWORD: admin
       DOLI_MODULES:     modSociete,modFacture,modProduit
     ports:
       - "8080:80"
@@ -254,7 +254,7 @@ El panel mostrará un resumen con cuántos productos se han creado y cuántos ya
 # 1. Obtener JWT de usuario
 TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"***********"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+  -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 # 2. Lanzar la sincronización
 curl -s -X POST http://localhost:3000/api/settings/setup-erp \

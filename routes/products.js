@@ -1,857 +1,142 @@
 const express = require('express');
-const rateLimit = require('express-rate-limit');
-const { body, param, query, validationResult } = require('express-validator');
-
 const db = require('../config/database');
-const {
-    authMiddleware,
-    apiTokenMiddleware,
-    adminMiddleware
-} = require('../middleware/auth');
-
+const { authMiddleware, apiTokenMiddleware } = require('../middleware/auth');
 const dolibarr = require('../lib/dolibarr');
 
 const router = express.Router();
 
+// GET /api/products — compatible con WordPress (acepta JWT de usuario O token de API con scope read:products)
+router.get('/', apiTokenMiddleware('read:products'), (req, res) => {
+    const search = req.query.search || '';
+    const category = req.query.category || '';
 
-// =============================
-// RATE LIMIT
-// =============================
+    let query;
 
-const productLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 200,
-    message:{
-        error:'Demasiadas peticiones'
+    if (search) {
+        // VULNERABLE: concatenación directa → SQL Injection
+        query = `SELECT * FROM products WHERE (name LIKE '%${search}%' OR sku LIKE '%${search}%' OR description LIKE '%${search}%')`;
+        if (category) query += ` AND category = '${category}'`;
+        query += ' ORDER BY name ASC';
+    } else if (category) {
+        query = `SELECT * FROM products WHERE category = '${category}' ORDER BY name ASC`;
+    } else {
+        query = 'SELECT * FROM products ORDER BY name ASC';
     }
+
+    db.all(query, (err, rows) => {
+        if (err) {
+            // Mensaje de error detallado → information disclosure
+            return res.status(500).json({ error: err.message, query });
+        }
+        res.json(rows);
+    });
 });
 
+// GET /api/products/:id
+router.get('/:id', authMiddleware, (req, res) => {
+    db.get('SELECT * FROM products WHERE id = ?', [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'Producto no encontrado.' });
+        res.json(row);
+    });
+});
 
-// =============================
-// AUDITORIA
-// =============================
+// POST /api/products
+router.post('/', authMiddleware, (req, res) => {
+    const { sku, name, description, price, stock, category } = req.body;
 
-const audit = (user, action, target)=>{
+    if (!sku || !name) {
+        return res.status(400).json({ error: 'SKU y nombre son obligatorios.' });
+    }
 
     db.run(
-        `
-        INSERT INTO audit_logs
-        (user_id,action,target)
-        VALUES (?,?,?)
-        `,
-        [
-            user.userId,
-            action,
-            target
-        ]
+        `INSERT INTO products (sku, name, description, price, stock, category)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [sku, name, description || '', price || 0, stock || 0, category || ''],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+            db.get('SELECT * FROM products WHERE id = ?', [this.lastID], (err, row) => {
+                // Sincronizar con Dolibarr en segundo plano (no bloquea la respuesta)
+                dolibarr.createProduct(db, row).catch(() => {});
+                res.status(201).json(row);
+            });
+        }
     );
-
-};
-
-
-
-// =============================
-// VALIDACIONES
-// =============================
-
-
-const validateProduct = [
-
-    body('sku')
-        .isString()
-        .isLength({
-            min:1,
-            max:50
-        }),
-
-    body('name')
-        .isString()
-        .isLength({
-            min:1,
-            max:150
-        }),
-
-    body('price')
-        .optional()
-        .isFloat({
-            min:0
-        }),
-
-    body('stock')
-        .optional()
-        .isInt({
-            min:0
-        })
-
-];
-
-
-
-
-
-// =================================
-// GET PRODUCTS
-// =================================
-
-
-router.get(
-'/',
-productLimiter,
-
-apiTokenMiddleware('read:products'),
-
-[
-query('search')
-.optional()
-.isLength({
-max:100
-}),
-
-query('category')
-.optional()
-.isLength({
-max:50
-})
-
-],
-
-(req,res)=>{
-
-
-const errors =
-validationResult(req);
-
-
-if(!errors.isEmpty()){
-
-return res.status(400)
-.json({
-error:'Parametros invalidos'
 });
 
-}
+// PUT /api/products/:id
+router.put('/:id', authMiddleware, (req, res) => {
+    const { sku, name, description, price, stock, category } = req.body;
 
+    db.run(
+        `UPDATE products SET sku=?, name=?, description=?, price=?, stock=?, category=?,
+         updated_at=strftime('%s','now') WHERE id=?`,
+        [sku, name, description, price, stock, category, req.params.id],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+            if (this.changes === 0) return res.status(404).json({ error: 'Producto no encontrado.' });
 
-
-const search =
-req.query.search || '';
-
-const category =
-req.query.category || '';
-
-
-
-let sql =
-`
-SELECT *
-FROM products
-WHERE 1=1
-`;
-
-
-
-const params=[];
-
-
-
-if(search){
-
-
-sql += `
-AND
-(
-name LIKE ?
-OR sku LIKE ?
-OR description LIKE ?
-)
-`;
-
-
-const value =
-`%${search}%`;
-
-
-params.push(
-value,
-value,
-value
-);
-
-}
-
-
-
-if(category){
-
-
-sql += `
-AND category = ?
-`;
-
-params.push(category);
-
-
-}
-
-
-
-sql += `
-ORDER BY name ASC
-`;
-
-
-
-
-db.all(
-sql,
-params,
-
-(err,rows)=>{
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error interno'
+            db.get('SELECT * FROM products WHERE id = ?', [req.params.id], (err, row) => {
+                res.json(row);
+            });
+        }
+    );
 });
 
-}
+// PATCH /api/products/:id/stock — actualizar stock con registro de movimiento
+router.patch('/:id/stock', authMiddleware, (req, res) => {
+    const { quantity, reason } = req.body;
+    const productId = req.params.id;
 
+    if (quantity === undefined) {
+        return res.status(400).json({ error: 'El campo quantity es obligatorio.' });
+    }
 
-res.json(rows);
+    db.get('SELECT * FROM products WHERE id = ?', [productId], (err, product) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
 
+        const newStock = product.stock + parseInt(quantity);
 
+        db.run(
+            `UPDATE products SET stock = ?, updated_at = strftime('%s','now') WHERE id = ?`,
+            [newStock, productId],
+            (err) => {
+                if (err) return res.status(500).json({ error: err.message });
 
+                db.run(
+                    `INSERT INTO stock_movements (product_id, quantity_change, reason, created_by)
+                     VALUES (?, ?, ?, ?)`,
+                    [productId, quantity, reason || '', req.user.userId]
+                );
+
+                res.json({ success: true, stock: newStock });
+            }
+        );
+    });
 });
 
-
+// GET /api/products/:id/movements — historial de movimientos
+router.get('/:id/movements', authMiddleware, (req, res) => {
+    db.all(
+        `SELECT sm.*, u.username FROM stock_movements sm
+         LEFT JOIN users u ON sm.created_by = u.id
+         WHERE sm.product_id = ? ORDER BY sm.created_at DESC LIMIT 50`,
+        [req.params.id],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json(rows);
+        }
+    );
 });
 
-
-
-
-
-
-
-
-// =================================
-// GET ONE
-// =================================
-
-
-router.get(
-'/:id',
-
-authMiddleware,
-
-param('id').isInt(),
-
-(req,res)=>{
-
-
-db.get(
-
-`
-SELECT *
-FROM products
-WHERE id=?
-`,
-
-[
-req.params.id
-],
-
-(err,row)=>{
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error interno'
+// DELETE /api/products/:id
+router.delete('/:id', authMiddleware, (req, res) => {
+    db.run('DELETE FROM products WHERE id = ?', [req.params.id], function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+        if (this.changes === 0) return res.status(404).json({ error: 'Producto no encontrado.' });
+        res.json({ success: true });
+    });
 });
-
-}
-
-
-
-if(!row){
-
-return res.status(404)
-.json({
-error:'Producto no encontrado'
-});
-
-}
-
-
-
-res.json(row);
-
-
-
-});
-
-
-});
-
-
-
-
-
-
-
-
-
-
-// =================================
-// CREATE
-// =================================
-
-
-router.post(
-
-'/',
-
-authMiddleware,
-adminMiddleware,
-
-validateProduct,
-
-(req,res)=>{
-
-
-const errors =
-validationResult(req);
-
-
-if(!errors.isEmpty()){
-
-return res.status(400)
-.json({
-error:'Datos invalidos'
-});
-
-}
-
-
-
-const {
-sku,
-name,
-description,
-price,
-stock,
-category
-}=req.body;
-
-
-
-db.run(
-
-`
-INSERT INTO products
-(
-sku,
-name,
-description,
-price,
-stock,
-category
-)
-VALUES(?,?,?,?,?,?)
-`,
-
-[
-sku,
-name,
-description || '',
-price || 0,
-stock || 0,
-category || ''
-],
-
-
-function(err){
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error creando producto'
-});
-
-}
-
-
-
-db.get(
-`
-SELECT *
-FROM products
-WHERE id=?
-`,
-[
-this.lastID
-],
-
-(err,row)=>{
-
-
-if(row){
-
-dolibarr
-.createProduct(db,row)
-.catch(()=>{});
-
-}
-
-
-
-audit(
-req.user,
-'PRODUCT_CREATED',
-this.lastID
-);
-
-
-
-res.status(201)
-.json(row);
-
-
-
-});
-
-
-
-});
-
-
-
-});
-
-
-
-
-
-
-
-
-// =================================
-// UPDATE
-// =================================
-
-
-router.put(
-
-'/:id',
-
-authMiddleware,
-adminMiddleware,
-
-validateProduct,
-
-(req,res)=>{
-
-
-const {
-sku,
-name,
-description,
-price,
-stock,
-category
-}=req.body;
-
-
-
-db.run(
-
-`
-UPDATE products SET
-
-sku=?,
-name=?,
-description=?,
-price=?,
-stock=?,
-category=?,
-updated_at=strftime('%s','now')
-
-WHERE id=?
-
-`,
-
-[
-sku,
-name,
-description,
-price,
-stock,
-category,
-req.params.id
-],
-
-
-function(err){
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error interno'
-});
-
-}
-
-
-
-if(this.changes===0){
-
-return res.status(404)
-.json({
-error:'Producto no encontrado'
-});
-
-}
-
-
-
-audit(
-req.user,
-'PRODUCT_UPDATED',
-req.params.id
-);
-
-
-
-res.json({
-success:true
-});
-
-
-});
-
-
-});
-
-
-
-
-
-
-
-
-
-
-// =================================
-// STOCK
-// =================================
-
-
-router.patch(
-
-'/:id/stock',
-
-authMiddleware,
-
-[
-param('id').isInt(),
-
-body('quantity')
-.isInt()
-.custom(v=>v!==0)
-
-],
-
-
-(req,res)=>{
-
-
-const quantity =
-Number(req.body.quantity);
-
-
-
-db.get(
-
-`
-SELECT stock
-FROM products
-WHERE id=?
-`,
-
-[
-req.params.id
-],
-
-(err,product)=>{
-
-
-if(err)
-return res.status(500)
-.json({
-error:'Error interno'
-});
-
-
-
-if(!product){
-
-return res.status(404)
-.json({
-error:'Producto no encontrado'
-});
-
-}
-
-
-
-const newStock =
-product.stock + quantity;
-
-
-
-if(newStock < 0){
-
-return res.status(400)
-.json({
-error:'Stock insuficiente'
-});
-
-}
-
-
-
-db.run(
-
-`
-UPDATE products
-SET stock=?
-WHERE id=?
-`,
-
-[
-newStock,
-req.params.id
-],
-
-(err)=>{
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error actualizando stock'
-});
-
-}
-
-
-
-db.run(
-
-`
-INSERT INTO stock_movements
-(
-product_id,
-quantity_change,
-reason,
-created_by
-)
-
-VALUES(?,?,?,?)
-
-`,
-
-[
-req.params.id,
-quantity,
-req.body.reason || '',
-req.user.userId
-]
-
-
-);
-
-
-
-audit(
-req.user,
-'STOCK_UPDATED',
-req.params.id
-);
-
-
-
-res.json({
-success:true,
-stock:newStock
-});
-
-
-
-});
-
-
-
-});
-
-
-
-});
-
-
-
-
-
-
-
-
-
-// =================================
-// MOVEMENTS
-// =================================
-
-
-router.get(
-
-'/:id/movements',
-
-authMiddleware,
-
-
-(req,res)=>{
-
-
-db.all(
-
-`
-SELECT sm.*,u.username
-
-FROM stock_movements sm
-
-LEFT JOIN users u
-ON sm.created_by=u.id
-
-WHERE sm.product_id=?
-
-ORDER BY sm.created_at DESC
-
-LIMIT 50
-
-`,
-
-[
-req.params.id
-],
-
-(err,rows)=>{
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error interno'
-});
-
-}
-
-
-res.json(rows);
-
-
-
-});
-
-
-});
-
-
-
-
-
-
-
-
-// =================================
-// DELETE
-// =================================
-
-
-router.delete(
-
-'/:id',
-
-authMiddleware,
-adminMiddleware,
-
-
-(req,res)=>{
-
-
-db.run(
-
-`
-DELETE FROM products
-WHERE id=?
-`,
-
-[
-req.params.id
-],
-
-function(err){
-
-
-if(err){
-
-return res.status(500)
-.json({
-error:'Error interno'
-});
-
-}
-
-
-
-if(this.changes===0){
-
-return res.status(404)
-.json({
-error:'Producto no encontrado'
-});
-
-}
-
-
-
-audit(
-req.user,
-'PRODUCT_DELETED',
-req.params.id
-);
-
-
-
-res.json({
-success:true
-});
-
-
-
-});
-
-
-});
-
-
-
 
 module.exports = router;
